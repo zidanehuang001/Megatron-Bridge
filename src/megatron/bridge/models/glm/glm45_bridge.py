@@ -27,6 +27,10 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     QKVMapping,
 )
+from megatron.bridge.models.glm.glm_moe_mappings import (
+    GLMExpertDownProjMapping,
+    GLMExpertGateUpProjMapping,
+)
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
@@ -65,7 +69,6 @@ class GLM45Bridge(MegatronModelBridge):
         provider.transformer_layer_spec = partial(get_gpt_decoder_block_spec, use_transformer_engine=HAVE_TE)
         provider.normalization = "RMSNorm"
         provider.gated_linear_unit = True
-        provider.position_embedding_type = "rope"
         provider.add_bias_linear = False
         provider.share_embeddings_and_output_weights = False
 
@@ -86,6 +89,7 @@ class GLM45Bridge(MegatronModelBridge):
         provider.bias_dropout_fusion = True
         provider.hidden_dropout = 0.0
         provider.autocast_dtype = torch.bfloat16
+        provider.mtp_num_layers = getattr(hf_config, "num_nextn_predict_layers", None)
         provider.mtp_loss_scaling_factor = 0.3
         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size
 
@@ -99,10 +103,15 @@ class GLM45Bridge(MegatronModelBridge):
         """Override to store config before mapping_registry is called."""
         # Store config on instance for use in mapping_registry
         self._hf_config = hf_pretrained.config
+        self._hf_state_source = hf_pretrained.state.source
+        self._hf_keys = list(self._hf_state_source.get_all_keys())
         return super().build_conversion_tasks(hf_pretrained, megatron_model)
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         mapping_list = []
+        use_fused_experts = self._uses_fused_experts()
+        gate_up_suffix = self._hf_expert_suffix("mlp.experts.gate_up_proj")
+        down_suffix = self._hf_expert_suffix("mlp.experts.down_proj")
 
         param_mappings = {
             # Embed
@@ -129,7 +138,6 @@ class GLM45Bridge(MegatronModelBridge):
             "decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.post_attention_layernorm.weight",
             "decoder.layers.*.mlp.shared_experts.linear_fc2.weight": "model.layers.*.mlp.shared_experts.down_proj.weight",
             "decoder.layers.*.mlp.shared_experts.router.weight": "model.layers.*.mlp.shared_experts.gate.weight",
-            "decoder.layers.*.mlp.experts.linear_fc2.weight*": "model.layers.*.mlp.experts.*.down_proj.weight",
             "decoder.layers.*.mlp.router.weight": "model.layers.*.mlp.gate.weight",
             "decoder.layers.*.mlp.router.expert_bias": "model.layers.*.mlp.gate.e_score_correction_bias",
         }
@@ -167,13 +175,35 @@ class GLM45Bridge(MegatronModelBridge):
                     gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
                     up="model.layers.*.mlp.shared_experts.up_proj.weight",
                 ),
-                GatedMLPMapping(
-                    megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
-                    gate="model.layers.*.mlp.experts.*.gate_proj.weight",
-                    up="model.layers.*.mlp.experts.*.up_proj.weight",
-                ),
             ]
         )
+        if use_fused_experts:
+            mapping_list.extend(
+                [
+                    GLMExpertGateUpProjMapping(
+                        megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                        hf_param=f"model.layers.*.mlp.experts.gate_up_proj{gate_up_suffix}",
+                    ),
+                    GLMExpertDownProjMapping(
+                        megatron_param="decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                        hf_param=f"model.layers.*.mlp.experts.down_proj{down_suffix}",
+                    ),
+                ]
+            )
+        else:
+            mapping_list.extend(
+                [
+                    GatedMLPMapping(
+                        megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                        gate="model.layers.*.mlp.experts.*.gate_proj.weight",
+                        up="model.layers.*.mlp.experts.*.up_proj.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param="decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                        hf_param="model.layers.*.mlp.experts.*.down_proj.weight",
+                    ),
+                ]
+            )
         # optionally add MTP mappings
         if not hasattr(self, "_hf_config"):
             logger.warning("No HF config found, skipping MTP mappings.")
@@ -182,16 +212,89 @@ class GLM45Bridge(MegatronModelBridge):
         num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
         num_transformer_layers = hf_config.num_hidden_layers
         for mtp_layer in range(num_mtp_layers):
-            for megatron_param, hf_param in layer_specific_mappings.items():
-                megatron_param = (
-                    megatron_param.replace(".*", ".*.transformer_layer")
-                    .replace("decoder", "mtp")
-                    .replace(".*", f".{mtp_layer}")
-                )
-                hf_param = hf_param.replace("layers.*", f"layers.{mtp_layer + num_transformer_layers}")
-                mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
+            # Support both naming conventions for the MTP transformer sub-layer: Megatron-Core
+            # may expose it as either "mtp_model_layer" or "transformer_layer" depending on
+            # configuration (see mimo_bridge.py for the same pattern).
+            for layer_prefix in ("mtp_model_layer", "transformer_layer"):
+                for megatron_param, hf_param in layer_specific_mappings.items():
+                    megatron_param = (
+                        megatron_param.replace(".*", f".*.{layer_prefix}")
+                        .replace("decoder", "mtp")
+                        .replace(".*", f".{mtp_layer}")
+                    )
+                    hf_param = hf_param.replace("layers.*", f"layers.{mtp_layer + num_transformer_layers}")
+                    mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 
-            # MTP specific mappings
+                # Special mappings that require parameter concatenation/transformation
+                mapping_list.extend(
+                    [
+                        QKVMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.self_attention.linear_qkv.weight",
+                            q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.weight",
+                            k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.weight",
+                            v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.weight",
+                        ),
+                        QKVMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.self_attention.linear_qkv.bias",
+                            q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.bias",
+                            k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.bias",
+                            v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.bias",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.linear_fc1.weight",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.linear_fc1.gate.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.linear_fc1.up.weight",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.shared_experts.linear_fc1.weight",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.gate_proj.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.up_proj.weight",
+                        ),
+                    ]
+                )
+                if use_fused_experts:
+                    mapping_list.extend(
+                        [
+                            GLMExpertGateUpProjMapping(
+                                megatron_param=(
+                                    f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.linear_fc1.weight*"
+                                ),
+                                hf_param=(
+                                    f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.gate_up_proj"
+                                    f"{gate_up_suffix}"
+                                ),
+                            ),
+                            GLMExpertDownProjMapping(
+                                megatron_param=(
+                                    f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.linear_fc2.weight*"
+                                ),
+                                hf_param=(
+                                    f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.down_proj"
+                                    f"{down_suffix}"
+                                ),
+                            ),
+                        ]
+                    )
+                else:
+                    mapping_list.extend(
+                        [
+                            GatedMLPMapping(
+                                megatron_param=(
+                                    f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.linear_fc1.weight*"
+                                ),
+                                gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
+                                up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
+                            ),
+                            AutoMapping(
+                                megatron_param=(
+                                    f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.linear_fc2.weight*"
+                                ),
+                                hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.down_proj.weight",
+                            ),
+                        ]
+                    )
+
+            # MTP specific mappings (not layer_prefix dependent)
             mapping_list.extend(
                 [
                     AutoMapping(
@@ -212,37 +315,30 @@ class GLM45Bridge(MegatronModelBridge):
                     ),
                 ]
             )
-            # Special mappings that require parameter concatenation/transformation
-            mapping_list.extend(
-                [
-                    QKVMapping(
-                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.weight",
-                        q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.weight",
-                        k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.weight",
-                        v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.weight",
-                    ),
-                    QKVMapping(
-                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.bias",
-                        q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.bias",
-                        k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.bias",
-                        v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.bias",
-                    ),
-                    GatedMLPMapping(
-                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc1.weight",
-                        gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.linear_fc1.gate.weight",
-                        up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.linear_fc1.up.weight",
-                    ),
-                    GatedMLPMapping(
-                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.mlp.shared_experts.linear_fc1.weight",
-                        gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.gate_proj.weight",
-                        up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.up_proj.weight",
-                    ),
-                    GatedMLPMapping(
-                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.mlp.experts.linear_fc1.weight*",
-                        gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
-                        up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
-                    ),
-                ]
-            )
 
         return MegatronMappingRegistry(*mapping_list)
+
+    def _uses_fused_experts(self) -> bool:
+        hf_keys = getattr(self, "_hf_keys", None)
+        if hf_keys:
+            if any("mlp.experts.gate_up_proj" in key for key in hf_keys) or any(
+                "mlp.experts.down_proj" in key for key in hf_keys
+            ):
+                return True
+
+        hf_source = getattr(self, "_hf_state_source", None)
+        if hf_source is not None:
+            return hf_source.has_glob("*mlp.experts.gate_up_proj*") or hf_source.has_glob("*mlp.experts.down_proj*")
+
+        return False
+
+    def _hf_expert_suffix(self, base_name: str) -> str:
+        hf_keys = getattr(self, "_hf_keys", None) or []
+        if any(f"{base_name}.weight" in key for key in hf_keys):
+            return ".weight"
+
+        hf_source = getattr(self, "_hf_state_source", None)
+        if hf_source is not None and hf_source.has_glob(f"*{base_name}.weight"):
+            return ".weight"
+
+        return ""

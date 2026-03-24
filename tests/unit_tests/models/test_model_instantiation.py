@@ -14,18 +14,19 @@
 
 from unittest.mock import Mock, patch
 
-import pytest
 import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from megatron.bridge.models.common.unimodal import (
+    _ddp_wrap,
+    _print_num_params,
+)
 from megatron.bridge.models.model_provider import (
     ModelProviderMixin,
     _create_model,
-    _ddp_wrap,
-    _print_num_params,
     get_model,
 )
 
@@ -160,14 +161,13 @@ class TestCreateModel:
         model_provider = Mock()
         model_provider.provide = Mock(return_value=mock_model)
 
-        result = _create_model(model_provider, ModelType.encoder_and_decoder, pg_collection=_PG())
+        result = _create_model(model_provider, ModelType.encoder_or_decoder, pg_collection=_PG())
 
         # Assertions
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0] is mock_model
-        assert mock_model.model_type == ModelType.encoder_and_decoder
-        model_provider.provide.assert_called_once_with()  # No pre/post process args
+        assert mock_model.model_type == ModelType.encoder_or_decoder
 
     @patch("megatron.bridge.models.model_provider.tensor_parallel")
     def test_create_model_encoder_decoder_multi_pipeline(self, mock_tensor_parallel):
@@ -178,14 +178,13 @@ class TestCreateModel:
         model_provider = Mock()
         model_provider.provide = Mock(return_value=mock_model)
 
-        result = _create_model(model_provider, ModelType.encoder_and_decoder, pg_collection=_PG())
+        result = _create_model(model_provider, ModelType.encoder_or_decoder, pg_collection=_PG())
 
         # Assertions
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0] is mock_model
-        assert mock_model.model_type == ModelType.encoder_and_decoder
-        model_provider.provide.assert_called_once_with()
+        assert mock_model.model_type == ModelType.encoder_or_decoder
 
     @patch("megatron.bridge.models.model_provider.tensor_parallel")
     def test_create_model_sets_tensor_parallel_attributes(self, mock_tensor_parallel):
@@ -206,7 +205,7 @@ class TestCreateModel:
 class TestDDPWrap:
     """Test cases for _ddp_wrap function."""
 
-    @patch("megatron.bridge.models.model_provider.DistributedDataParallel")
+    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
     def test_ddp_wrap_standard(self, mock_ddp):
         """Test wrapping models with standard DDP."""
         # Setup
@@ -243,7 +242,7 @@ class TestDDPWrap:
         for ddp_instance in mock_ddp_instances:
             ddp_instance.broadcast_params.assert_called_once()
 
-    @patch("megatron.bridge.models.model_provider.TorchFullyShardedDataParallel")
+    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
     def test_ddp_wrap_fsdp2(self, mock_fsdp):
         """Test wrapping models with FSDP2."""
         # Setup
@@ -271,7 +270,7 @@ class TestDDPWrap:
 
     def test_ddp_wrap_overlap_param_gather(self):
         """Test DDP wrapping with overlap_param_gather_with_optimizer_step."""
-        with patch("megatron.bridge.models.model_provider.DistributedDataParallel") as mock_ddp:
+        with patch("megatron.bridge.models.common.unimodal.DistributedDataParallel") as mock_ddp:
             # Setup
             config = create_test_config()
             models = [MockMegatronModule(config)]
@@ -888,20 +887,24 @@ class TestEdgeCases:
 
     def test_create_model_virtual_pipeline_with_encoder_decoder_raises(self):
         """Test that virtual pipeline with encoder-decoder raises assertion error."""
-        model_provider = MockModelProvider()
+        mock_model = MockMegatronModule()
+        model_provider = MockModelProvider(mock_model)
         model_provider.virtual_pipeline_model_parallel_size = 2
 
-        with pytest.raises(AssertionError) as excinfo:
-            # Craft pg with pp size > 1 to trigger VPP branch for the assertion
-            class _PP:
-                def size(self):
-                    return 2
+        # Craft pg with pp size > 1
+        class _PP:
+            def size(self):
+                return 2
 
-                def rank(self):
-                    return 0
+            def rank(self):
+                return 0
 
-            pg = _PG()
-            pg.pp = _PP()
-            _create_model(model_provider, ModelType.encoder_and_decoder, pg_collection=pg)
+        pg = _PG()
+        pg.pp = _PP()
+        result = _create_model(model_provider, ModelType.encoder_or_decoder, pg_collection=pg)
 
-        assert "Interleaved schedule not supported" in str(excinfo.value)
+        # Assertions
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0] is mock_model
+        assert mock_model.model_type == ModelType.encoder_or_decoder

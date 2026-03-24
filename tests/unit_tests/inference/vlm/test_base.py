@@ -247,6 +247,7 @@ class TestSetupInferenceWrapper:
         # Build the nested structure: model.module.language_model.decoder
         mock_language_model = MockObject()
         mock_language_model.decoder = mock_decoder
+        mock_language_model.vocab_size = 151936
 
         mock_module = MockObject()
         mock_module.language_model = mock_language_model
@@ -275,8 +276,7 @@ class TestSetupInferenceWrapper:
 
         mock_model = MockObject()
         mock_model.config = MagicMock(spec=Qwen3VLModelProvider)
-        mock_model.config.language_transformer_config = MagicMock()
-        mock_model.config.language_transformer_config.hidden_size = 2048
+        mock_model.config.hidden_size = 2048
         mock_model.cuda = MagicMock(return_value=mock_model)
         mock_model.to = MagicMock(return_value=mock_model)
         mock_model.eval = MagicMock()

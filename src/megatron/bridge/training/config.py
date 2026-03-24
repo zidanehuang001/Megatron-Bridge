@@ -29,6 +29,7 @@ from megatron.core.optimizer import (
     ParamGroupOverride,
     ParamKey,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig as MCoreMLATransformerConfig
@@ -36,6 +37,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig as MC
 
 from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
 from megatron.bridge.models import GPTModelProvider, T5ModelProvider
+from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
+from megatron.bridge.models.mamba.mamba_builder import MambaModelConfig
 from megatron.bridge.models.mamba.mamba_provider import MambaModelProvider
 from megatron.bridge.models.mimo.mimo_provider import MimoModelProvider
 from megatron.bridge.peft.base import PEFT
@@ -197,6 +200,25 @@ class DistributedInitConfig:
     distributed_timeout_seconds_after_init: int | None = None
     """Timeout in seconds for process groups after initialization. This timeout is applied to all process groups after initialization and the first iteration completes."""
 
+    flight_recorder_dump_path: str | None = None
+    """Path for NCCL flight recorder trace dumps. Sets TORCH_FR_DUMP_TEMP_FILE and
+    TORCH_NCCL_DEBUG_INFO_TEMP_FILE env variables before distributed init."""
+
+    flight_recorder_trace_buffer_size: int = 2000
+    """Size of the NCCL flight recorder trace buffer (TORCH_NCCL_TRACE_BUFFER_SIZE)."""
+
+    flight_recorder_dump_on_timeout: bool = True
+    """Dump flight recorder traces on NCCL timeout (TORCH_NCCL_DUMP_ON_TIMEOUT)."""
+
+    flight_recorder_include_stack_trace: bool = False
+    """Include stack traces in flight recorder dumps (TORCH_INCLUDE_STACK_TRACE)."""
+
+    flight_recorder_include_only_active: bool = True
+    """Include only active operations in flight recorder dumps (TORCH_INCLUDE_ONLY_ACTIVE)."""
+
+    flight_recorder_extra_dump_on_exec: bool = True
+    """Enable extra flight recorder dump on execution (TORCH_NCCL_EXTRA_DUMP_ON_EXEC)."""
+
     disable_jit_fuser: bool = False
     """Disable the JIT fuser."""
 
@@ -240,7 +262,7 @@ class DataloaderConfig:
     """Dataloader type: 'single' for single pass, 'cyclic' for multiple passes with shuffling,
     'batch' for global batch sampling (used in fine-tuning), or 'external' for custom dataloaders."""
 
-    num_workers: int = 8
+    num_workers: int = 2
     """Dataloader number of workers."""
 
     data_sharding: bool = True
@@ -249,11 +271,20 @@ class DataloaderConfig:
     pin_memory: bool = True
     """Whether to pin memory during data loading for faster GPU training."""
 
-    persistent_workers: bool = False
-    """Whether to keep data loading workers persistent across epochs."""
+    drop_last: bool = True
+    """Whether to drop the last incomplete batch."""
+
+    persistent_workers: bool = True
+    """Whether to keep data loading workers persistent across epochs.
+    Automatically set to False when num_workers is 0."""
 
     trust_remote_code: Optional[bool] = None
     """Whether remote code execution should be trusted for a given HF path."""
+
+    def finalize(self):
+        """Finalize dataloader config field constraints."""
+        if self.num_workers == 0 and self.persistent_workers:
+            self.persistent_workers = False
 
 
 @dataclass(frozen=True)
@@ -268,12 +299,14 @@ class DatasetBuildContext:
         valid_samples: Number of samples for validation dataset
         test_samples: Number of samples for test dataset
         tokenizer: Optional tokenizer instance for text processing
+        pg_collection: Optional process group collection for distributed training
     """
 
     train_samples: int
     valid_samples: int
     test_samples: int
     tokenizer: Optional[MegatronTokenizer] = None
+    pg_collection: Optional[ProcessGroupCollection] = None
 
 
 @dataclass(frozen=True)
@@ -407,10 +440,17 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
     for field modifications after construction but before computed fields are calculated.
     """
 
+    data_path: str | list[str] | None = None
+    """CLI-friendly alternative to ``blend``.  Accepts a single path string,
+    a space-separated multi-path string, or a list of paths (with optional
+    interleaved weights, matching Megatron-LM ``--data-path`` semantics).
+    Converted to ``blend`` automatically during ``finalize()``."""
+
     def __init__(
         self,
         seq_length: int | None = None,
         skip_getting_attention_mask_from_dataset: bool = True,
+        data_path: str | list[str] | None = None,
         *args,
         **kwargs,
     ):
@@ -419,8 +459,10 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
             seq_length (int | None): the sequence length. If not provided, `sequence_length` must be in kwargs.
             skip_getting_attention_mask_from_dataset (bool): if set, the dataset will pass a None attention mask
                 and the attention mask is autogenerated from the attn backend.
+            data_path: CLI-friendly data path(s). Converted to ``blend`` in ``finalize()``.
         """
         self.skip_getting_attention_mask_from_dataset = skip_getting_attention_mask_from_dataset
+        self.data_path = data_path
 
         if seq_length is not None:
             kwargs["sequence_length"] = seq_length
@@ -453,6 +495,14 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         This method calls the original Megatron Core GPTDatasetConfig.__post_init__()
         and then performs Bridge-specific validation.
         """
+        if self.blend is None and self.data_path is not None:
+            from megatron.core.datasets.utils import get_blend_from_list
+
+            if isinstance(self.data_path, str):
+                paths = self.data_path.split()
+            else:
+                paths = list(self.data_path)
+            self.blend = get_blend_from_list(paths)
 
         # Call MCore's post_init
         super(MCoreGPTDatasetConfig, self).__post_init__()
@@ -460,6 +510,8 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         assert self.reset_position_ids is not None, "reset_position_ids must be defined."
         assert self.reset_attention_mask is not None, "reset_attention_mask must be defined."
         assert self.eod_mask_loss is not None, "eod_mask_loss must be defined."
+
+        DataloaderConfig.finalize(self)
 
 
 @dataclass
@@ -841,13 +893,26 @@ class CheckpointConfig:
     Assumed when loading a release checkpoint."""
 
     pretrained_checkpoint: Optional[str] = None
-    """Directory containing a pretrained model checkpoint for finetuning."""
+    """Directory containing a pretrained model checkpoint for finetuning.
+
+    This can be either:
+      - A parent checkpoint directory (e.g. ``/checkpoints/my_model/``) that
+        contains tracker files (``latest_train_state.pt``) and ``iter_*``
+        subdirectories.
+      - A specific iteration directory (e.g.
+        ``/checkpoints/my_model/iter_0001000/``) that directly contains the
+        checkpoint payload (``run_config.yaml``, weight shards, etc.).
+    """
 
     ckpt_step: Optional[int] = None
     """Checkpoint step to load model from."""
 
     use_checkpoint_args: bool = False
     """Override any command line arguments with arguments from the checkpoint"""
+
+    storage_writers_per_rank: int = 1
+    """Number of storage writers per rank for torch_dist checkpoint format.
+    Affects the number of checkpoint files: saving_ranks * storage_writers_per_rank."""
 
     exit_on_missing_checkpoint: bool = False
     """If 'load' is set, but checkpoint is not found (e.g., path typo), then exit instead of random initialization."""
@@ -922,6 +987,13 @@ class CheckpointConfig:
 
     def finalize(self) -> None:
         """Post-initialization checks for checkpoint config."""
+        if self.pretrained_checkpoint is not None:
+            from megatron.bridge.training.utils.checkpoint_utils import file_exists
+
+            assert file_exists(self.pretrained_checkpoint), (
+                f"Pretrained checkpoint {self.pretrained_checkpoint} does not exist"
+            )
+
         if self.load_main_params_from_ckpt:
             assert not self.load_optim, "load_main_params_from_ckpt must be used with load_optim=False"
 
@@ -1051,6 +1123,21 @@ class LoggerConfig:
     mlflow_tags: Optional[dict[str, str]] = None
     """Optional tags to apply to the MLFlow run."""
 
+    comet_project: Optional[str] = None
+    """The Comet ML project name. Comet logging is disabled when this is None."""
+
+    comet_experiment_name: Optional[str] = None
+    """The Comet ML experiment name."""
+
+    comet_workspace: Optional[str] = None
+    """The Comet ML workspace. If not set, uses the default workspace for the API key."""
+
+    comet_api_key: Optional[str] = None
+    """The Comet ML API key. Can also be set via COMET_API_KEY environment variable."""
+
+    comet_tags: Optional[list[str]] = None
+    """Optional list of tags to apply to the Comet ML experiment."""
+
     logging_level: int = logging.INFO
     """Set default logging level"""
 
@@ -1094,6 +1181,30 @@ class LoggerConfig:
                     "Install it via pip install mlflow or uv add mlflow"
                 ) from exc
 
+        if self.comet_project and (self.comet_experiment_name is None or self.comet_experiment_name == ""):
+            raise ValueError("Set logger.comet_experiment_name when enabling Comet ML logging.")
+
+        using_comet = any(
+            [
+                self.comet_project,
+                self.comet_experiment_name,
+                self.comet_workspace,
+                self.comet_api_key,
+                self.comet_tags,
+            ]
+        )
+
+        if using_comet:
+            try:
+                import importlib
+
+                importlib.import_module("comet_ml")
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "Comet ML logging is configured, but the 'comet_ml' package is not installed. "
+                    "Install it via pip install comet-ml or uv add comet-ml"
+                ) from exc
+
 
 @dataclass(kw_only=True)
 class ProfilingConfig:
@@ -1117,7 +1228,16 @@ class ProfilingConfig:
     use_pytorch_profiler: bool = False
     """Use the built-in pytorch profiler. Useful if you wish to view profiles in tensorboard."""
 
-    profile_ranks: list[int] = field(default_factory=lambda: [0])
+    pytorch_profiler_collect_shapes: bool = False
+    """Collect tensor shape in pytorch profiler."""
+
+    pytorch_profiler_collect_callstack: bool = False
+    """Collect callstack in pytorch profiler."""
+
+    pytorch_profiler_collect_chakra: bool = False
+    """Collect chakra trace in pytorch profiler."""
+
+    profile_ranks: list[int] = field(default_factory=lambda: [])
     """Global ranks to profile."""
 
     record_memory_history: bool = False
@@ -1352,7 +1472,9 @@ class ConfigContainer(Container):
     rng: RNGConfig = field(default_factory=RNGConfig)
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     train: TrainingConfig
-    model: GPTModelProvider | T5ModelProvider | MambaModelProvider | MimoModelProvider
+    model: (
+        GPTModelProvider | T5ModelProvider | MambaModelProvider | MimoModelProvider | GPTModelConfig | MambaModelConfig
+    )
     optimizer: OptimizerConfig
     optimizer_config_override_provider: OptimizerConfigOverrideProvider = field(
         default_factory=OptimizerConfigOverrideProvider
@@ -1435,7 +1557,12 @@ class ConfigContainer(Container):
         Ensures compatibility between different configuration settings.
         """
 
-        if isinstance(self.dataset, GPTDatasetConfig):
+        # Propagate in-batch packing flag to model config so TransformerConfig.finalize()
+        # can enable variable_seq_lengths for pipeline parallelism.
+        if getattr(self.dataset, "pack_sequences_in_batch", False):
+            self.model._pack_sequences_in_batch = True
+
+        if hasattr(self.dataset, "finalize"):
             self.dataset.finalize()
         if hasattr(self.ddp, "finalize"):
             self.ddp.finalize()
@@ -1507,14 +1634,11 @@ class ConfigContainer(Container):
                     "Megatron FSDP only supports fsdp_dtensor checkpoint format"
                 )
 
-            if self.ddp.average_in_collective:
-                print_rank_0("average_in_collective is not supported with Megatron FSDP, setting to True")
+            if self.ddp.average_in_collective and not self.ddp.disable_symmetric_registration:
+                print_rank_0(
+                    "average_in_collective is not supported with NCCL symmetric registration, setting to False"
+                )
                 self.ddp.average_in_collective = False
-
-            # TODO: This can be removed once NVIDIA/TransformerEngine#2371 is available to use
-            if self.model.gradient_accumulation_fusion:
-                print_rank_0("Gradient accumulation fusion is not supported with Megatron FSDP, setting to False")
-                self.model.gradient_accumulation_fusion = False
 
             # reuse_grad_buf_for_mxfp8_param_ag is not supported with Megatron FSDP
             if self.ddp.reuse_grad_buf_for_mxfp8_param_ag:
@@ -1637,7 +1761,10 @@ class ConfigContainer(Container):
                 )
 
         # Validate DeepEP or HybridEP is supported for the current GPU architecture
-        validate_flex_dispatcher_backend(self.model)
+        if isinstance(self.model, (GPTModelConfig, MambaModelConfig)):
+            validate_flex_dispatcher_backend(self.model.transformer)
+        else:
+            validate_flex_dispatcher_backend(self.model)
 
         for f in fields(ValidationConfig):
             train_val = getattr(self.train, f.name)
@@ -1708,6 +1835,25 @@ class ConfigContainer(Container):
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
 
+        # Enforce the Megatron Core invariant: lr_warmup_steps must be < lr_decay_steps.
+        # This can be violated when train_iters is small (e.g. smoke runs) while
+        # lr_warmup_iters is tuned for a full-length training run.
+        if self.scheduler.lr_decay_steps <= 0:
+            raise ValueError(
+                f"lr_decay_steps must be > 0, got {self.scheduler.lr_decay_steps}. "
+                "Please increase train_iters/train_samples or lr_decay_iters/lr_decay_samples."
+            )
+        if self.scheduler.lr_warmup_steps >= self.scheduler.lr_decay_steps:
+            capped = self.scheduler.lr_decay_steps - 1
+            warnings.warn(
+                f"lr_warmup_steps ({self.scheduler.lr_warmup_steps}) >= lr_decay_steps "
+                f"({self.scheduler.lr_decay_steps}); capping lr_warmup_steps to {capped}. "
+                "Reduce lr_warmup_iters (or lr_warmup_samples) for short training runs.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.scheduler.lr_warmup_steps = capped
+
     def log_non_default_values(self) -> None:
         """Log configuration values that differ from Megatron Core defaults.
 
@@ -1718,21 +1864,27 @@ class ConfigContainer(Container):
         For configs that don't inherit from Mcore, key values are logged via
         `_get_key_config_values`, which excludes None values and callables.
         """
+        if isinstance(self.model, (GPTModelConfig, MambaModelConfig)):
+            transformer_cfg = self.model.transformer
+        else:
+            transformer_cfg = self.model
         # Determine the correct Mcore parent class for the model config
         # Some models (e.g., DeepSeek) use MLATransformerConfig instead of TransformerConfig
-        model_mcore_class = _get_mcore_transformer_parent(self.model)
+        model_mcore_class = _get_mcore_transformer_parent(transformer_cfg)
 
         # Map of config names to their (config object, Mcore parent class or None)
         mcore_configs = [
             ("optimizer", self.optimizer, MCoreOptimizerConfig),
             ("ddp", self.ddp, MCoreDistributedDataParallelConfig),
-            ("model", self.model, model_mcore_class),
+            ("model", transformer_cfg, model_mcore_class),
         ]
 
         # Non-Mcore configs - log all values
         non_mcore_configs = [
             ("train", self.train),
+            ("validation", self.validation),
             ("scheduler", self.scheduler),
+            ("dataset", self.dataset),
             ("checkpoint", self.checkpoint),
             ("logger", self.logger),
             ("tokenizer", self.tokenizer),

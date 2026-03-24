@@ -22,6 +22,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import AutoMapping
+from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
 from megatron.bridge.models.deepseek.common import get_common_mapping_list
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
@@ -51,7 +52,6 @@ class DeepSeekV3Bridge(MegatronModelBridge):
         provider.transformer_layer_spec = partial(get_gpt_decoder_block_spec, use_transformer_engine=HAVE_TE)
         provider.normalization = "RMSNorm"
         provider.gated_linear_unit = True
-        provider.position_embedding_type = "rope"
         provider.add_bias_linear = False
         provider.share_embeddings_and_output_weights = False
         provider.qk_layernorm = True
@@ -62,20 +62,20 @@ class DeepSeekV3Bridge(MegatronModelBridge):
         provider.moe_token_dispatcher_type = "alltoall"
         provider.moe_router_load_balancing_type = "seq_aux_loss"
         provider.moe_shared_expert_overlap = True
+        provider.moe_router_score_function = "sigmoid"
         provider.moe_router_enable_expert_bias = True
         provider.moe_router_dtype = "fp32"
         provider.moe_permute_fusion = True
         provider.moe_aux_loss_coeff = 0.0001
 
         provider.apply_rope_fusion = False
+        provider.gradient_accumulation_fusion = True
         provider.bias_activation_fusion = True
         provider.bias_dropout_fusion = True
         provider.cross_entropy_fusion_impl = "te"
         provider.cross_entropy_loss_fusion = True
         provider.masked_softmax_fusion = True
         provider.persist_layer_norm = True
-        provider.async_tensor_model_parallel_allreduce = True
-        provider.gradient_accumulation_fusion = True
 
         provider.hidden_dropout = 0.0
         provider.attention_softmax_in_fp32 = False
@@ -88,13 +88,19 @@ class DeepSeekV3Bridge(MegatronModelBridge):
         )
         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
 
-        # TODO: mtp
-        provider.mtp_num_layers = None
+        provider.mtp_num_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or None
 
         return provider
 
+    def build_conversion_tasks(self, hf_pretrained, megatron_model):
+        """Override to store config before mapping_registry is called."""
+        # Store config on instance for use in mapping_registry
+        self._hf_config = hf_pretrained.config
+        return super().build_conversion_tasks(hf_pretrained, megatron_model)
+
     def mapping_registry(self) -> MegatronMappingRegistry:
-        mapping_list = get_common_mapping_list()
+        hf_config = getattr(self, "_hf_config", None)
+        mapping_list = get_common_mapping_list(hf_config=hf_config)
         mapping_list.append(
             AutoMapping(
                 megatron_param="decoder.layers.*.mlp.router.expert_bias",
@@ -139,7 +145,7 @@ class DeepSeekV3Bridge(MegatronModelBridge):
         inv_freq = getattr(self, "_deepseek_inv_freq", None)
         if inv_freq is None:
             rotary_dim = self.hf_config.qk_rope_head_dim
-            rotary_base = self.hf_config.rope_theta
+            rotary_base = rope_theta_from_hf(self.hf_config)
             inv_freq = 1.0 / (rotary_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
             self._deepseek_inv_freq = inv_freq
 
