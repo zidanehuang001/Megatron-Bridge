@@ -20,6 +20,7 @@ import random
 import shutil
 import sys
 import threading
+from dataclasses import replace
 from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
@@ -30,7 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from megatron.core import dist_checkpointing, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
 from megatron.core.dist_checkpointing.serialization import (
     StateDict,
     get_default_load_sharded_strategy,
@@ -1452,6 +1453,32 @@ def _interleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tens
     return bias
 
 
+def _is_swiglu_fc1_checkpoint_key(key: str) -> bool:
+    """True for MoE local-expert SwiGLU linear_fc1 weights/biases (not shared_experts)."""
+    return (
+        "shared_experts" not in key
+        and "experts" in key
+        and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
+    )
+
+
+def _apply_glu_interleave_to_tensor_data(
+    key: str, tensor: torch.Tensor, interleave_size: int, interleave: bool
+) -> torch.Tensor:
+    """Run interleave or de-interleave on a plain tensor (fc1 weight or bias)."""
+    if "linear_fc1.weight" in key:
+        return (
+            _interleave_glu_weight(tensor, interleave_size)
+            if interleave
+            else _deinterleave_glu_weight(tensor, interleave_size)
+        )
+    return (
+        _interleave_glu_bias(tensor, interleave_size)
+        if interleave
+        else _deinterleave_glu_bias(tensor, interleave_size)
+    )
+
+
 def _process_state_dict_for_glu_interleaving(
     model_state_dict: dict[str, Any],
     interleave_size: int,
@@ -1467,40 +1494,54 @@ def _process_state_dict_for_glu_interleaving(
     """
     if not isinstance(model_state_dict, dict):
         return model_state_dict
-    
-    processed_state_dict = {}
+
+    processed_state_dict: dict[str, Any] = {}
     num_keys_processed = 0
     operation = "interleaved" if interleave else "de-interleaved"
+
     for key, value in model_state_dict.items():
-        if not isinstance(value, torch.Tensor):
+        if not _is_swiglu_fc1_checkpoint_key(key):
             processed_state_dict[key] = value
             continue
-        
-        # Check if this is a SwiGLU fc1 weight or bias for local experts
-        # NOTE: Must match the condition in _zero_out_fc1_w_weights_for_testing
-        is_swiglu_fc1 = (
-            "shared_experts" not in key 
-            and "experts" in key
-            and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
-        )
-        if is_swiglu_fc1:
-            if "linear_fc1.weight" in key:
-                if interleave:
-                    processed_state_dict[key] = _interleave_glu_weight(value, interleave_size)
-                else:
-                    processed_state_dict[key] = _deinterleave_glu_weight(value, interleave_size)
-            elif "linear_fc1.bias" in key:
-                if interleave:
-                    processed_state_dict[key] = _interleave_glu_bias(value, interleave_size)
-                else:
-                    processed_state_dict[key] = _deinterleave_glu_bias(value, interleave_size)
+
+        if isinstance(value, ShardedTensor):
+            if value.data is None:
+                processed_state_dict[key] = value
+                continue
+            new_data = _apply_glu_interleave_to_tensor_data(
+                key, value.data, interleave_size, interleave
+            )
+            # Interleaving permutes elements; local shape unchanged. Preserve global sharding metadata.
+            processed_state_dict[key] = replace(value, data=new_data, local_shape=new_data.shape)
             num_keys_processed += 1
-        else:
-            processed_state_dict[key] = value
-    
+            continue
+
+        if isinstance(value, ShardedObject):
+            if not isinstance(value.data, torch.Tensor):
+                processed_state_dict[key] = value
+                continue
+            new_data = _apply_glu_interleave_to_tensor_data(
+                key, value.data, interleave_size, interleave
+            )
+            processed_state_dict[key] = replace(value, data=new_data)
+            num_keys_processed += 1
+            continue
+
+        if isinstance(value, torch.Tensor):
+            processed_state_dict[key] = _apply_glu_interleave_to_tensor_data(
+                key, value, interleave_size, interleave
+            )
+            num_keys_processed += 1
+            continue
+
+        processed_state_dict[key] = value
+
     if num_keys_processed > 0:
-        print_rank_0(f'[GLU Interleaving] Processed {num_keys_processed} SwiGLU fc1 keys (weights and biases): {operation} with interleave_size={interleave_size}')
-    
+        print_rank_0(
+            f"[GLU Interleaving] Processed {num_keys_processed} SwiGLU fc1 keys "
+            f"(weights and biases): {operation} with interleave_size={interleave_size}"
+        )
+
     return processed_state_dict
 
 
@@ -1834,7 +1875,7 @@ def _load_checkpoint_from_path(
                         state_dict[model_key] = _process_state_dict_for_glu_interleaving(
                             state_dict[model_key], model_interleave_size
                         )
-        
+
         # Handle PEFT resume for strict loading
         load_strict = strict
         is_peft_resume = (
