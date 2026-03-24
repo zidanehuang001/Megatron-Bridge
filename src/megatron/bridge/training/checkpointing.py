@@ -1845,7 +1845,7 @@ def _load_checkpoint_from_path(
         update_num_microbatches(consumed_samples=state.train_state.consumed_train_samples, verbose=True)
 
     # Load model weights
-    if not skip_load_to_model_and_opt:
+    if not skip_load_to_model_and_opt and ckpt_type != CheckpointType.FSDP_DTENSOR:
         # Process state dict for GLU interleaving if needed
         # Assumption: checkpoints are always in contiguous (non-interleaved) format
         from megatron.core.utils import get_model_config
