@@ -1402,8 +1402,9 @@ def _deinterleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Te
     shape = bias.shape
     bias = bias.reshape(
         shape[0] // (2 * interleave_size),  # num_blocks
-        2,                                   # W and V interleaved
-        interleave_size                      # block size
+        2,  # W and V interleaved
+        interleave_size,  # block size
+        *shape[1:],
     )
     bias = bias.transpose(0, 1).contiguous()
     bias = bias.reshape(shape)
@@ -1422,7 +1423,7 @@ def _interleave_glu_weight(weight: torch.Tensor, interleave_size: int) -> torch.
     
     weight = weight.reshape(
         2,                                        # W and V
-        dim_to_interleave // (2 * interleave_size),  # num_blocks
+        shape[0] // (2 * interleave_size),  # num_blocks
         interleave_size,                          # block size
         *shape[1:]                                # remaining dimensions
     )
@@ -1439,15 +1440,14 @@ def _interleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tens
     Output format: [W0:31, V0:31, W32:63, V32:63, ...]
     """
     shape = bias.shape
-    dim_to_interleave = shape[-1]  # Last dimension for bias
-    
+
     bias = bias.reshape(
-        *shape[:-1],
-        2,                                        # W and V
-        dim_to_interleave // (2 * interleave_size),  # num_blocks
-        interleave_size                           # block size
+        2,
+        shape[0] // (2 * interleave_size),
+        interleave_size,
+        *shape[1:],
     )
-    bias = bias.transpose(-3, -2).contiguous()
+    bias = bias.transpose(0, 1).contiguous()
     bias = bias.reshape(shape)
     return bias
 
