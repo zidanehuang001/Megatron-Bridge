@@ -14,23 +14,26 @@
 # limitations under the License.
 
 # ==============================================================================
-# Step-3.5-Flash Conversion Round-Trip Verification (Multi-Node via Slurm)
+# Step-3.5-Flash Conversion Round-Trip Verification (Single-Node via Slurm)
 #
 # Step-3.5-Flash (MoE: 288 experts, top-8, 196.81B total / ~11B active)
-# Requires at least 8 nodes (64 GPUs) — 288 experts / EP=16 = 18 experts per rank.
-# TP does NOT reduce expert memory — use EP instead.
+# Runs on 1 node × 8 GPUs (H100/A100 80 GB recommended).
+#
+# Memory per GPU at EP=8: ~58 GB model weights (36 experts/rank × ~1.3 GB +
+# ~10 GB non-expert weights). Fits in 80 GB GPUs with headroom for buffers.
+# TP does NOT reduce expert memory — use EP to distribute experts.
 #
 # Sweeps multiple parallelism configs (TP,PP,EP) to verify HF <-> Megatron
 # round-trip conversion. Each config runs sequentially.
 #
 # Usage:
 #   1. Fill in CONTAINER_IMAGE, CONTAINER_MOUNTS, and token exports
-#   2. Adjust PARALLELISM_CONFIGS if needed (TP*PP*EP must equal NODES*GPUS_PER_NODE)
+#   2. Adjust PARALLELISM_CONFIGS if needed (TP*PP*EP must equal GPUS_PER_NODE=8)
 #   3. Submit: sbatch examples/models/step3/slurm_conversion.sh
 # ==============================================================================
 
 #SBATCH --job-name=step3-flash-roundtrip
-#SBATCH --nodes=8
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
 #SBATCH --time=6:00:00
@@ -52,10 +55,10 @@ WORKDIR="/opt/Megatron-Bridge"
 # export UV_CACHE_DIR="/path/to/shared/uv_cache"
 
 # ── Parallelism configs: "TP,PP,EP" per entry ────────────────────────────
-# TP*PP*EP must equal total GPUs (NODES * GPUS_PER_NODE = 64).
-# EP must divide 288 (number of experts): 16, 32, 48, 96, 144, 288, ...
-# Recommended: EP=16 (18 experts/rank); PP balances layer memory.
-PARALLELISM_CONFIGS=("1,4,16" "1,2,16" "2,2,16")
+# TP*PP*EP must equal total GPUs (GPUS_PER_NODE=8).
+# EP must divide 288 (number of experts): 1, 2, 4, 8, 16, ...
+# Recommended: EP=8 (36 experts/rank) — best memory balance on 8 GPUs.
+PARALLELISM_CONFIGS=("1,1,8" "2,1,4" "1,2,4")
 
 # ── Model ─────────────────────────────────────────────────────────────────
 MODEL_NAME=Step-3.5-Flash
@@ -70,7 +73,7 @@ export NCCL_NVLS_ENABLE=0
 # ==============================================================================
 
 echo "======================================"
-echo "Step-3.5-Flash Round-Trip Conversion Sweep"
+echo "Step-3.5-Flash Round-Trip Conversion Sweep (1 node × 8 GPUs)"
 echo "Job: $SLURM_JOB_ID | Nodes: $SLURM_JOB_NUM_NODES"
 echo "Parallelism configs: ${PARALLELISM_CONFIGS[*]}"
 echo "======================================"

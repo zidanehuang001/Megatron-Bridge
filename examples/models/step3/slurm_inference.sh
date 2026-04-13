@@ -14,12 +14,13 @@
 # limitations under the License.
 
 # ==============================================================================
-# Step-3.5-Flash Inference (Multi-Node via Slurm)
+# Step-3.5-Flash Inference (Single-Node via Slurm)
 #
 # Step-3.5-Flash (MoE: 288 experts, top-8, 196.81B total / ~11B active)
-# Requires at least 8 nodes (64 GPUs).
-# Minimum EP=16 (8 nodes) for inference; increasing TP does NOT reduce expert
-# memory — increase EP instead.
+# Runs on 1 node × 8 GPUs (H100/A100 80 GB recommended).
+#
+# EP=8 distributes 288 experts across 8 ranks (36 experts/rank, ~58 GB/GPU).
+# TP does NOT reduce expert memory — use EP instead.
 #
 # Usage:
 #   1. Fill in CONTAINER_IMAGE, CONTAINER_MOUNTS, and token exports
@@ -27,7 +28,7 @@
 # ==============================================================================
 
 #SBATCH --job-name=step3-flash-inference
-#SBATCH --nodes=8
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
 #SBATCH --time=2:00:00
@@ -54,8 +55,8 @@ HF_MODEL_ID=stepfun-ai/$MODEL_NAME
 PROMPT="What is artificial intelligence?"
 MAX_NEW_TOKENS=100
 TP=1
-PP=4
-EP=16
+PP=1
+EP=8
 
 # ── Environment ───────────────────────────────────────────────────────────
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
@@ -66,7 +67,7 @@ export NCCL_NVLS_ENABLE=0
 # ==============================================================================
 
 echo "======================================"
-echo "Step-3.5-Flash Inference"
+echo "Step-3.5-Flash Inference (1 node × 8 GPUs)"
 echo "Job: $SLURM_JOB_ID | Nodes: $SLURM_JOB_NUM_NODES"
 echo "TP=$TP PP=$PP EP=$EP (Total GPUs: $((TP * PP * EP)))"
 echo "======================================"

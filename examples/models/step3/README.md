@@ -7,11 +7,18 @@ This directory contains example scripts for [Step-3.5-Flash](https://huggingface
 
 ## Hardware Requirements
 
-Step-3.5-Flash requires **at least 8 nodes (64 GPUs)** for conversion and inference because:
+Step-3.5-Flash conversion and inference run on **1 node × 8 GPUs** (H100/A100 80 GB):
 
-- 288 routed experts × bfloat16 weights dominate memory; with EP=16 each rank holds 18 experts.
+| Component | Per-GPU at EP=8 |
+|---|---|
+| Routed expert weights (36 experts/rank) | ~47 GB |
+| Non-expert weights (replicated) | ~10 GB |
+| **Total model weights** | **~57 GB** |
+| Remaining headroom (80 GB GPU) | ~23 GB (KV cache / buffers) |
+
+- EP=8 distributes 288 experts across 8 ranks → 36 experts per rank.
 - TP does **not** reduce expert memory — use EP instead.
-- Minimum recommended config: `TP=1, PP=4, EP=16` (8 nodes × 8 GPUs = 64 GPUs).
+- Recommended config for 8 GPUs: `TP=1, PP=1, EP=8`.
 
 ## Checkpoint Conversion
 
@@ -38,14 +45,14 @@ sbatch examples/models/step3/slurm_conversion.sh
 
 ```
 ======================================
-Step-3.5-Flash Round-Trip Conversion Sweep
-Job: <JOB_ID> | Nodes: 8
-Parallelism configs: 1,4,16 1,2,16 2,2,16
+Step-3.5-Flash Round-Trip Conversion Sweep (1 node × 8 GPUs)
+Job: <JOB_ID> | Nodes: 1
+Parallelism configs: 1,1,8 2,1,4 1,2,4
 ======================================
-Config 1/3: TP=1, PP=4, EP=16
+Config 1/3: TP=1, PP=1, EP=8
 ...
 All parameters match: True ✅
-[OK] Config 1: TP=1, PP=4, EP=16 passed
+[OK] Config 1: TP=1, PP=1, EP=8 passed
 ...
 All 3 configs passed
 ======================================
@@ -64,7 +71,7 @@ python examples/conversion/convert_checkpoints.py import \
     --hf-model stepfun-ai/Step-3.5-Flash \
     --trust-remote-code \
     --megatron-path /path/to/megatron_ckpt \
-    --tp 1 --pp 4 --ep 16
+    --tp 1 --pp 1 --ep 8
 ```
 
 Or use [slurm_conversion.sh](slurm_conversion.sh) for a multi-node round-trip verification.
@@ -122,7 +129,7 @@ If `lm loss` stays flat or NaN appears within the first 10 steps, check:
 
 ## Inference
 
-[slurm_inference.sh](slurm_inference.sh) runs text generation on the full checkpoint with `TP=1, EP=16, PP=4`.
+[slurm_inference.sh](slurm_inference.sh) runs text generation on the full checkpoint with `TP=1, PP=1, EP=8` (1 node × 8 GPUs).
 
 ### Setup
 
@@ -143,9 +150,9 @@ sbatch examples/models/step3/slurm_inference.sh
 
 ```
 ======================================
-Step-3.5-Flash Inference
-Job: <JOB_ID> | Nodes: 8
-TP=1 PP=4 EP=16 (Total GPUs: 64)
+Step-3.5-Flash Inference (1 node × 8 GPUs)
+Job: <JOB_ID> | Nodes: 1
+TP=1 PP=1 EP=8 (Total GPUs: 8)
 ======================================
 ...
 ======== GENERATED TEXT OUTPUT ========
