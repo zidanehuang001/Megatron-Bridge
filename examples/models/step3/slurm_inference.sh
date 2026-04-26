@@ -41,7 +41,9 @@
 CONTAINER_IMAGE=""
 # CONTAINER_IMAGE="/path/to/container.sqsh"
 CONTAINER_MOUNTS=""
-# CONTAINER_MOUNTS="/lustre:/lustre,/path/to/project:/opt/Megatron-Bridge"
+# IMPORTANT: Mount BOTH repos so the 3rdparty/Megatron-LM symlink resolves
+# inside the container (symlink ../../Megatron-LM -> /opt/Megatron-LM).
+# CONTAINER_MOUNTS="/path/to/Megatron-Bridge:/opt/Megatron-Bridge,/path/to/Megatron-LM:/opt/Megatron-LM"
 WORKDIR="/opt/Megatron-Bridge"
 
 # ── Tokens / Caches ──────────────────────────────────────────────────────
