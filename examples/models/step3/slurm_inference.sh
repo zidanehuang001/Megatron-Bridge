@@ -63,6 +63,8 @@ EP=8
 # ── Environment ───────────────────────────────────────────────────────────
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
+# Reduce fragmentation for large MoE models
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ==============================================================================
 # Job Execution
@@ -81,13 +83,20 @@ if [ -z "$CONTAINER_IMAGE" ]; then
     exit 1
 fi
 
+# ── PyTorch distributed rendezvous (env://) ──────────────────────────────
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+
 SRUN_CMD="srun --mpi=pmix --container-image=$CONTAINER_IMAGE"
 if [ -n "$CONTAINER_MOUNTS" ]; then
     SRUN_CMD="$SRUN_CMD --container-mounts=$CONTAINER_MOUNTS"
 fi
 
-# Sync dependencies once per node, then run inference
-CMD="if [ \"\$SLURM_LOCALID\" -eq 0 ]; then uv sync; else sleep 10; fi && "
+# Map Slurm task IDs to PyTorch distributed env vars, then run inference.
+# Rank 0 on each node runs uv sync; other ranks wait to avoid concurrent cache writes.
+CMD="export RANK=\$SLURM_PROCID WORLD_SIZE=\$SLURM_NTASKS LOCAL_RANK=\$SLURM_LOCALID && "
+CMD="${CMD}if [ \"\$SLURM_LOCALID\" -eq 0 ]; then uv sync; else sleep 10; fi && "
 CMD="${CMD}uv run --no-sync python examples/conversion/hf_to_megatron_generate_text.py"
 CMD="$CMD --hf_model_path $HF_MODEL_ID"
 CMD="$CMD --prompt '$PROMPT'"

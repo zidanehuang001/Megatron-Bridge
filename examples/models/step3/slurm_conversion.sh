@@ -70,6 +70,8 @@ HF_MODEL_ID=stepfun-ai/$MODEL_NAME
 # ── Environment ───────────────────────────────────────────────────────────
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
+# Reduce fragmentation for large MoE models
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ==============================================================================
 # Job Execution
@@ -88,6 +90,13 @@ if [ -z "$CONTAINER_IMAGE" ]; then
     exit 1
 fi
 
+# ── PyTorch distributed rendezvous (env://) ──────────────────────────────
+# srun --mpi=pmix does NOT set MASTER_ADDR/MASTER_PORT automatically.
+# These are exported here so all srun tasks inherit them via the container env.
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+
 SRUN_CMD="srun --mpi=pmix --container-image=$CONTAINER_IMAGE"
 if [ -n "$CONTAINER_MOUNTS" ]; then
     SRUN_CMD="$SRUN_CMD --container-mounts=$CONTAINER_MOUNTS"
@@ -103,8 +112,10 @@ for CONFIG in "${PARALLELISM_CONFIGS[@]}"; do
     echo "Config $CONFIG_INDEX/${#PARALLELISM_CONFIGS[@]}: TP=$TP, PP=$PP, EP=$EP"
     echo "======================================"
 
-    # Sync dependencies once per node, then run the roundtrip
-    CMD="if [ \"\$SLURM_LOCALID\" -eq 0 ]; then uv sync; else sleep 10; fi && "
+    # Map Slurm task IDs to PyTorch distributed env vars, then run the roundtrip.
+    # Rank 0 on each node runs uv sync; other ranks wait to avoid concurrent cache writes.
+    CMD="export RANK=\$SLURM_PROCID WORLD_SIZE=\$SLURM_NTASKS LOCAL_RANK=\$SLURM_LOCALID && "
+    CMD="${CMD}if [ \"\$SLURM_LOCALID\" -eq 0 ]; then uv sync; else sleep 10; fi && "
     CMD="${CMD}uv run --no-sync python examples/conversion/hf_megatron_roundtrip_multi_gpu.py"
     CMD="$CMD --hf-model-id $HF_MODEL_ID"
     CMD="$CMD --tp $TP --pp $PP --ep $EP"

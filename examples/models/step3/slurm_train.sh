@@ -101,14 +101,22 @@ if [ -z "$CONTAINER_IMAGE" ]; then
     exit 1
 fi
 
+# ── PyTorch distributed rendezvous (env://) ──────────────────────────────
+# srun --mpi=pmix does NOT set MASTER_ADDR/MASTER_PORT automatically.
+# These are exported here so all srun tasks inherit them via the container env.
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+
 SRUN_CMD="srun --mpi=pmix --container-image=$CONTAINER_IMAGE"
 if [ -n "$CONTAINER_MOUNTS" ]; then
     SRUN_CMD="$SRUN_CMD --container-mounts=$CONTAINER_MOUNTS"
 fi
 
-# Sync dependencies once per node (rank 0 on each node runs uv sync;
-# other local ranks wait to avoid concurrent writes to the same cache).
-SYNC="if [ \"\$SLURM_LOCALID\" -eq 0 ]; then uv sync; else sleep 10; fi"
+# Map Slurm task IDs to PyTorch distributed env vars.
+# Rank 0 on each node runs uv sync; other ranks wait to avoid concurrent writes.
+SYNC="export RANK=\$SLURM_PROCID WORLD_SIZE=\$SLURM_NTASKS LOCAL_RANK=\$SLURM_LOCALID && "
+SYNC="${SYNC}if [ \"\$SLURM_LOCALID\" -eq 0 ]; then uv sync; else sleep 10; fi"
 
 TRAIN_CMD="uv run --no-sync python examples/models/step3/train_step3_flash.py"
 TRAIN_CMD="$TRAIN_CMD --mode $TRAIN_MODE"
